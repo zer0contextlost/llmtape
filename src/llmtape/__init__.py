@@ -72,16 +72,27 @@ def _qualified_name(fn: Callable) -> str:
 
     Uses __name__ (not __qualname__) to avoid '<locals>' segments that differ
     between the record and replay call sites. Uses module to distinguish same-named
-    functions across different modules.
+    functions across different modules. Falls back to repr for partials/lambdas
+    that lack a meaningful __name__.
     """
-    module = (getattr(fn, "__module__", None) or "").replace(".", "_")
-    name = fn.__name__
+    module = getattr(fn, "__module__", None) or ""
+    name = getattr(fn, "__name__", None)
+    if not name or name == "<lambda>":
+        name = getattr(fn, "__qualname__", None) or repr(fn)
     return f"{module}__{name}" if module else name
 
 
-def _warn_if_stale(path: "Path", cfg) -> None:
-    from ._cassette import age_days
-    days = age_days(path)
+def _warn_if_stale(path: "Path", cfg, data: dict) -> None:
+    """Warn if the cassette is older than max_age_days. Accepts pre-loaded data to avoid double read."""
+    from datetime import datetime, timezone
+    recorded_at_str = data.get("metadata", {}).get("recorded_at", "")
+    if not recorded_at_str:
+        return
+    try:
+        recorded = datetime.fromisoformat(recorded_at_str)
+        days = (datetime.now(timezone.utc) - recorded).total_seconds() / 86400
+    except Exception:
+        return
     if days > cfg.max_age_days:
         log.warning(
             "llmtape: cassette '%s' is %.0f days old (max_age_days=%d). "
@@ -100,8 +111,8 @@ def _intercept(qualified: str, cfg, original_fn: Callable, provider: str, *args,
     mode = cfg.mode
 
     if mode in ("replay", "record-missing") and path.exists():
-        _warn_if_stale(path, cfg)
         data = load_cassette(path)
+        _warn_if_stale(path, cfg, data)
         raw = data["response"]["raw"]
         prov = data.get("provider", provider)
         return dict_to_response(raw, prov)
@@ -138,8 +149,8 @@ async def _intercept_async(qualified: str, cfg, original_fn: Callable, provider:
     mode = cfg.mode
 
     if mode in ("replay", "record-missing") and path.exists():
-        _warn_if_stale(path, cfg)
         data = load_cassette(path)
+        _warn_if_stale(path, cfg, data)
         raw = data["response"]["raw"]
         prov = data.get("provider", provider)
         return dict_to_response(raw, prov)

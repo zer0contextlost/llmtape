@@ -172,13 +172,15 @@ def delete(pattern, cassette_dir, yes):
 @click.argument("name")
 @click.option("--cassette-dir", default=".cassettes", show_default=True)
 @click.option("--yes", is_flag=True, help="Skip confirmation before overwriting")
-def rerecord(name, cassette_dir, yes):
+@click.option("--dry-run", is_flag=True, help="Show diff without making a live call or overwriting")
+def rerecord(name, cassette_dir, yes, dry_run):
     """Re-record a cassette by making a live API call and showing the diff.
 
     Loads the existing cassette, makes a fresh live call using the saved
     request, shows what changed, and prompts before overwriting.
 
     Requires the appropriate provider SDK and API key to be set.
+    Use --dry-run to preview what would happen without touching the file.
     """
     path = Path(cassette_dir) / name
     if not path.exists():
@@ -196,6 +198,26 @@ def rerecord(name, cassette_dir, yes):
     console.print(f"\n[bold]Re-recording:[/bold] {path.name}")
     console.print(f"  Provider: {provider}  |  Model: {request.get('model', '?')}")
     console.print(f"  Recorded: {meta.get('recorded_at', '?')}")
+
+    # Refuse to rerecord if the stored request contains redacted values — the
+    # live call would send "[REDACTED]" as the actual content, producing corrupt cassettes.
+    def _has_redacted(obj) -> bool:
+        if isinstance(obj, str):
+            return "[REDACTED]" in obj
+        if isinstance(obj, dict):
+            return any(_has_redacted(v) for v in obj.values())
+        if isinstance(obj, list):
+            return any(_has_redacted(item) for item in obj)
+        return False
+
+    if _has_redacted(request):
+        console.print(
+            "[red]Cannot rerecord: the stored request contains [REDACTED] values.[/red]\n"
+            "The cassette was saved with redaction rules that removed sensitive fields.\n"
+            "Re-recording would send literal '[REDACTED]' to the API and corrupt the cassette.\n"
+            "To fix: delete the cassette and record fresh with LLMTAPE_MODE=record-missing."
+        )
+        raise SystemExit(1)
 
     # Make live call
     import time
@@ -257,6 +279,10 @@ def rerecord(name, cassette_dir, yes):
     console.print(f"\n  Tokens in:  {old_in} -> {new_in} ({new_in - old_in:+d})")
     console.print(f"  Tokens out: {old_out} -> {new_out} ({new_out - old_out:+d})")
     console.print(f"  Latency:    {meta.get('latency_ms', '?')}ms -> {latency_ms}ms")
+
+    if dry_run:
+        console.print("\n[yellow]--dry-run: cassette not overwritten.[/yellow]")
+        return
 
     if not yes:
         click.confirm("\nOverwrite cassette with new recording?", abort=True)

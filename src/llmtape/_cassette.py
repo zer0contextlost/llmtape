@@ -84,8 +84,6 @@ def _json_default(obj: Any) -> Any:
     so fingerprints don't silently become non-deterministic on Pydantic models etc."""
     if hasattr(obj, "model_dump"):
         return obj.model_dump()
-    if hasattr(obj, "__dict__"):
-        return obj.__dict__
     raise TypeError(
         f"Object of type {type(obj).__name__} is not JSON-serializable. "
         "Convert it to a primitive (dict/list/str/int/float) before passing to the LLM API."
@@ -100,9 +98,10 @@ def fingerprint(normalized: dict) -> str:
 def cassette_path(cassette_dir: str, qualified_name: str, fp: str) -> Path:
     """Build cassette path from qualified function name (module.qualname) and fingerprint."""
     safe_name = re.sub(r"[^\w]", "_", qualified_name)
-    # Trim very long names but keep enough to be human-readable
     if len(safe_name) > 60:
-        safe_name = safe_name[-60:]
+        # Append 6-char hash of the full name so truncated names don't collide
+        name_hash = hashlib.sha256(safe_name.encode()).hexdigest()[:6]
+        safe_name = safe_name[-54:] + "_" + name_hash
     return Path(cassette_dir) / f"{safe_name}_{fp[:12]}.yaml"
 
 
