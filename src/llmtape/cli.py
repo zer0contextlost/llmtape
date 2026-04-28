@@ -1,7 +1,9 @@
 import click
+import difflib
 from pathlib import Path
 from rich.console import Console
 from rich.table import Table
+from rich.syntax import Syntax
 import yaml
 
 console = Console()
@@ -164,3 +166,146 @@ def delete(pattern, cassette_dir, yes):
     for f in matches:
         f.unlink()
     console.print(f"[green]Deleted {len(matches)} cassette(s)[/green]")
+
+
+@cli.command()
+@click.argument("name")
+@click.option("--cassette-dir", default=".cassettes", show_default=True)
+@click.option("--yes", is_flag=True, help="Skip confirmation before overwriting")
+@click.option("--dry-run", is_flag=True, help="Show diff without making a live call or overwriting")
+def rerecord(name, cassette_dir, yes, dry_run):
+    """Re-record a cassette by making a live API call and showing the diff.
+
+    Loads the existing cassette, makes a fresh live call using the saved
+    request, shows what changed, and prompts before overwriting.
+
+    Requires the appropriate provider SDK and API key to be set.
+    Use --dry-run to preview what would happen without touching the file.
+    """
+    path = Path(cassette_dir) / name
+    if not path.exists():
+        path = Path(cassette_dir) / f"{name}.yaml"
+    if not path.exists():
+        console.print(f"[red]Cassette not found: {name}[/red]")
+        raise SystemExit(1)
+
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    provider = data.get("provider", "")
+    request = data.get("request", {}).get("normalized", {})
+    old_raw = data.get("response", {}).get("raw", {})
+    meta = data.get("metadata", {})
+
+    console.print(f"\n[bold]Re-recording:[/bold] {path.name}")
+    console.print(f"  Provider: {provider}  |  Model: {request.get('model', '?')}")
+    console.print(f"  Recorded: {meta.get('recorded_at', '?')}")
+
+    # Refuse to rerecord if the stored request contains redacted values — the
+    # live call would send "[REDACTED]" as the actual content, producing corrupt cassettes.
+    def _has_redacted(obj) -> bool:
+        if isinstance(obj, str):
+            return "[REDACTED]" in obj
+        if isinstance(obj, dict):
+            return any(_has_redacted(v) for v in obj.values())
+        if isinstance(obj, list):
+            return any(_has_redacted(item) for item in obj)
+        return False
+
+    if _has_redacted(request):
+        console.print(
+            "[red]Cannot rerecord: the stored request contains [REDACTED] values.[/red]\n"
+            "The cassette was saved with redaction rules that removed sensitive fields.\n"
+            "Re-recording would send literal '[REDACTED]' to the API and corrupt the cassette.\n"
+            "To fix: delete the cassette and record fresh with LLMTAPE_MODE=record-missing."
+        )
+        raise SystemExit(1)
+
+    # Make live call
+    import time
+    try:
+        if provider == "openai":
+            import openai
+            client = openai.OpenAI()
+            t0 = time.monotonic()
+            response = client.chat.completions.create(**request)
+            latency_ms = int((time.monotonic() - t0) * 1000)
+            new_raw = response.model_dump()
+        elif provider == "anthropic":
+            import anthropic
+            client = anthropic.Anthropic()
+            t0 = time.monotonic()
+            response = client.messages.create(**request)
+            latency_ms = int((time.monotonic() - t0) * 1000)
+            new_raw = response.model_dump()
+        else:
+            console.print(f"[red]Unsupported provider for rerecord: {provider}[/red]")
+            raise SystemExit(1)
+    except Exception as e:
+        console.print(f"[red]Live call failed: {e}[/red]")
+        raise SystemExit(1)
+
+    # Extract text content for diffing
+    def _extract_text(raw: dict, prov: str) -> str:
+        if prov == "openai":
+            return (raw.get("choices", [{}])[0].get("message", {}).get("content") or "")
+        if prov == "anthropic":
+            blocks = raw.get("content", [])
+            return "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text")
+        return ""
+
+    old_text = _extract_text(old_raw, provider)
+    new_text = _extract_text(new_raw, provider)
+
+    # Show diff
+    if old_text == new_text:
+        console.print("\n[green]Response content is identical.[/green]")
+    else:
+        diff = list(difflib.unified_diff(
+            old_text.splitlines(keepends=True),
+            new_text.splitlines(keepends=True),
+            fromfile="old", tofile="new", lineterm="",
+        ))
+        console.print(f"\n[bold yellow]Content diff:[/bold yellow]")
+        console.print(Syntax("".join(diff), "diff", theme="monokai"))
+
+    # Token delta
+    def _tokens(raw: dict, prov: str) -> tuple[int, int]:
+        u = raw.get("usage", {})
+        if prov == "openai":
+            return u.get("prompt_tokens", 0), u.get("completion_tokens", 0)
+        return u.get("input_tokens", 0), u.get("output_tokens", 0)
+
+    old_in, old_out = _tokens(old_raw, provider)
+    new_in, new_out = _tokens(new_raw, provider)
+    console.print(f"\n  Tokens in:  {old_in} -> {new_in} ({new_in - old_in:+d})")
+    console.print(f"  Tokens out: {old_out} -> {new_out} ({new_out - old_out:+d})")
+    console.print(f"  Latency:    {meta.get('latency_ms', '?')}ms -> {latency_ms}ms")
+
+    if dry_run:
+        console.print("\n[yellow]--dry-run: cassette not overwritten.[/yellow]")
+        return
+
+    if not yes:
+        click.confirm("\nOverwrite cassette with new recording?", abort=True)
+
+    from llmtape._cassette import (
+        save, normalize_request, fingerprint, cassette_path as _cassette_path
+    )
+    from llmtape._config import get_config
+    from llmtape._extract import sdk_version
+
+    cfg = get_config()
+    fn_name = meta.get("function_name", path.stem)
+    normalized = normalize_request(request, cfg.redact)
+    fp = fingerprint(normalized)
+
+    save(
+        path=path,
+        provider=provider,
+        normalized_request=normalized,
+        fp=fp,
+        raw_response=new_raw,
+        sdk_version=sdk_version(provider),
+        latency_ms=latency_ms,
+        function_name=fn_name,
+    )
+    console.print(f"\n[green]Cassette updated: {path.name}[/green]")

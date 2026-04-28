@@ -67,26 +67,59 @@ def _get_provider_targets() -> list[tuple[str, str, str]]:
     return targets
 
 
-def _intercept(function_name: str, cfg, original_fn: Callable, provider: str, *args, **kwargs) -> Any:
+def _qualified_name(fn: Callable) -> str:
+    """Return module__name for cassette filenames.
+
+    Uses __name__ (not __qualname__) to avoid '<locals>' segments that differ
+    between the record and replay call sites. Uses module to distinguish same-named
+    functions across different modules. Falls back to repr for partials/lambdas
+    that lack a meaningful __name__.
+    """
+    module = getattr(fn, "__module__", None) or ""
+    name = getattr(fn, "__name__", None)
+    if not name or name == "<lambda>":
+        name = getattr(fn, "__qualname__", None) or repr(fn)
+    return f"{module}__{name}" if module else name
+
+
+def _warn_if_stale(path: "Path", cfg, data: dict) -> None:
+    """Warn if the cassette is older than max_age_days. Accepts pre-loaded data to avoid double read."""
+    from datetime import datetime, timezone
+    recorded_at_str = data.get("metadata", {}).get("recorded_at", "")
+    if not recorded_at_str:
+        return
+    try:
+        recorded = datetime.fromisoformat(recorded_at_str)
+        days = (datetime.now(timezone.utc) - recorded).total_seconds() / 86400
+    except Exception:
+        return
+    if days > cfg.max_age_days:
+        log.warning(
+            "llmtape: cassette '%s' is %.0f days old (max_age_days=%d). "
+            "Re-record with LLMTAPE_MODE=record-missing.",
+            path.name, days, cfg.max_age_days,
+        )
+
+
+def _intercept(qualified: str, cfg, original_fn: Callable, provider: str, *args, **kwargs) -> Any:
     """Shared sync interception logic."""
     raw_request = extract_request_from_kwargs(provider, kwargs)
     normalized = normalize_request(raw_request, cfg.redact)
     fp = fingerprint(normalized)
-    path = cassette_path(cfg.cassette_dir, function_name, fp)
+    path = cassette_path(cfg.cassette_dir, qualified, fp)
 
     mode = cfg.mode
 
-    # replay or record-missing with existing cassette
     if mode in ("replay", "record-missing") and path.exists():
         data = load_cassette(path)
+        _warn_if_stale(path, cfg, data)
         raw = data["response"]["raw"]
         prov = data.get("provider", provider)
         return dict_to_response(raw, prov)
 
     if mode == "replay":
-        raise CassetteNotFoundError(function_name, fp, str(path), normalized)
+        raise CassetteNotFoundError(qualified, fp, str(path), normalized)
 
-    # record
     t0 = time.monotonic()
     response = original_fn(*args, **kwargs)
     latency_ms = int((time.monotonic() - t0) * 1000)
@@ -101,28 +134,29 @@ def _intercept(function_name: str, cfg, original_fn: Callable, provider: str, *a
         raw_response=raw_response,
         sdk_version=sdk_version(prov),
         latency_ms=latency_ms,
-        function_name=function_name,
+        function_name=qualified,
     )
     return response
 
 
-async def _intercept_async(function_name: str, cfg, original_fn: Callable, provider: str, *args, **kwargs) -> Any:
+async def _intercept_async(qualified: str, cfg, original_fn: Callable, provider: str, *args, **kwargs) -> Any:
     """Shared async interception logic."""
     raw_request = extract_request_from_kwargs(provider, kwargs)
     normalized = normalize_request(raw_request, cfg.redact)
     fp = fingerprint(normalized)
-    path = cassette_path(cfg.cassette_dir, function_name, fp)
+    path = cassette_path(cfg.cassette_dir, qualified, fp)
 
     mode = cfg.mode
 
     if mode in ("replay", "record-missing") and path.exists():
         data = load_cassette(path)
+        _warn_if_stale(path, cfg, data)
         raw = data["response"]["raw"]
         prov = data.get("provider", provider)
         return dict_to_response(raw, prov)
 
     if mode == "replay":
-        raise CassetteNotFoundError(function_name, fp, str(path), normalized)
+        raise CassetteNotFoundError(qualified, fp, str(path), normalized)
 
     t0 = time.monotonic()
     response = await original_fn(*args, **kwargs)
@@ -138,7 +172,7 @@ async def _intercept_async(function_name: str, cfg, original_fn: Callable, provi
         raw_response=raw_response,
         sdk_version=sdk_version(prov),
         latency_ms=latency_ms,
-        function_name=function_name,
+        function_name=qualified,
     )
     return response
 
@@ -150,35 +184,21 @@ def tape(fn: Callable) -> Callable:
     Intercepts calls to openai.chat.completions.create and anthropic.messages.create
     for the duration of the wrapped function.
     """
+    qualified = _qualified_name(fn)
+
     if asyncio.iscoroutinefunction(fn):
         @functools.wraps(fn)
         async def async_wrapper(*args, **kwargs):
             cfg = get_config()
-            captured: list[tuple[str, Any, Any, tuple, dict]] = []
 
             def make_sync_patch(provider: str, original):
                 def patched(*a, **kw):
-                    result_container = []
-                    exc_container = []
-
-                    async def _run():
-                        try:
-                            r = await _intercept_async(fn.__name__, cfg, original, provider, *a, **kw)
-                            result_container.append(r)
-                        except Exception as e:
-                            exc_container.append(e)
-
-                    # We're inside an async context — run synchronously isn't possible.
-                    # Use a thread-local event loop approach:
-                    # Instead, we directly call the async intercept from the patched sync method.
-                    # This path shouldn't be reached in async code (async clients use async methods).
                     raise RuntimeError("Sync provider method called inside async function — use async client")
-
                 return patched
 
             def make_async_patch(provider: str, original):
                 async def patched(*a, **kw):
-                    return await _intercept_async(fn.__name__, cfg, original, provider, *a, **kw)
+                    return await _intercept_async(qualified, cfg, original, provider, *a, **kw)
                 return patched
 
             patches = _build_patches(make_sync_patch, make_async_patch)
@@ -193,12 +213,12 @@ def tape(fn: Callable) -> Callable:
 
             def make_sync_patch(provider: str, original):
                 def patched(*a, **kw):
-                    return _intercept(fn.__name__, cfg, original, provider, *a, **kw)
+                    return _intercept(qualified, cfg, original, provider, *a, **kw)
                 return patched
 
             def make_async_patch(provider: str, original):
                 async def patched(*a, **kw):
-                    return await _intercept_async(fn.__name__, cfg, original, provider, *a, **kw)
+                    return await _intercept_async(qualified, cfg, original, provider, *a, **kw)
                 return patched
 
             patches = _build_patches(make_sync_patch, make_async_patch)
