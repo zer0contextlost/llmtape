@@ -234,8 +234,9 @@ class TestTapeSync:
             []
         )
         fp = fingerprint(req)
-        path = cassette_path(str(tmp_cassettes), "ask", fp)
-        _write_cassette(path, "openai", req, _make_openai_response("Paris"), "ask")
+        # Qualified name matches what @tape will compute: module__funcname
+        path = cassette_path(str(tmp_cassettes), "test_core__ask", fp)
+        _write_cassette(path, "openai", req, _make_openai_response("Paris"), "test_core__ask")
 
         client = openai.OpenAI(api_key="fake")
 
